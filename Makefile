@@ -23,15 +23,21 @@ install:
 	test -d $DHDIR && cp script.sh $DHDIR/ddns-update
 
 install-deps:
-	$(MAKE) `uname -s`
+	$(MAKE) install-deps-`uname -s`
 
 install-deps-FreeBSD:
 	pkg install p5-Net-IP
 	pkg install p5-Net-DNS
 	pkg install bind-tools
 
+
+APTPKGS=libnet-ip-perl
+
 install-deps-Linux:
-	@exit 1
+	@test -f /usr/bin/apt && apt install -y $(APTPKGS)
+
+install-deps-Darwin:
+	@echo Nothing to do
 
 install-deps-SunOS:
 	pkg install perl
