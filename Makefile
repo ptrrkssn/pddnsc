@@ -37,3 +37,6 @@ install-deps-SunOS:
 	pkg install perl
 	perl -MCPAN -e 'install Net::IP'
 	perl -MCPAN -e 'install Sys::Hostname::Long'
+
+check:
+	./pddnsc -h
