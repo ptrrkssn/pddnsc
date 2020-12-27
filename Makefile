@@ -35,7 +35,7 @@ install-deps-FreeBSD:
 
 install-deps-Linux:
 	@if [ -f /usr/bin/apt ]; then \
-		apt install -y $(APTPKGS); \
+		apt-get install -y $(APTPKGS); \
 	else \
 		yum install -y $(RPMPKGS); \
 	fi
