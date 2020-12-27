@@ -1,0 +1,56 @@
+pddnsc
+
+A perl script to perform smart GSS-TSIG-authentiated RFC2136-compliant
+DDNS updates from Unix clients, for example triggered by DHCP updates.
+It will try to update IPv4 & IPv6 forward and reverse DNS pointers.
+
+Copyright (c) 2020, Peter Eriksson <pen@lysator.liu.se>
+All rights reserved.
+
+License:
+  BSD standard 3-clause license. See the file LICENSE for details.
+  
+
+Website:
+  https://github.com/ptrrkssn/ddns-updater
+
+
+System Requirements:
+  1. perl (with Net::IP & Net::DNS)
+  2. nsupdate from BIND
+  3. A Kerberos (AD) joined Unix client
+  4. Optionally: dhclient or NetworkManager DHCP clients
+  5. Linux. Probably also on FreeBSD (edit path to perl) & Solaris.
+
+
+Usage:
+
+1. Put the "pddnsc" script into /sbin
+
+2. Create a script to be called from the DHCP client:
+
+  NetworkManager:
+    Create a script '90-ddns-update' in /etc/NetworkManager/dispatcher.d:
+
+  dhclient:
+    Create a script 'ddns-update' in /etc/dhcp/dhclient-exit-hooks.d:
+
+  The script:
+    #!/bin/sh
+    exec /sbin/pddnsc "$@"
+
+
+You can also call the script manually to force an update:
+
+  /sbin/pddnsc -v -d -T 1w
+
+
+If you wish to see the generated DNS updates without actually performing
+them, use:
+
+  /sbin/pddnsc -nvdf
+
+(possibly with "-K-" if running as non-root (disables GSS-TSIG/TSIG))
+
+
+Use "-h" for more help/usage information.

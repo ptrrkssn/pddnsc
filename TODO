@@ -1,0 +1,3 @@
+- Handle multiple DNS names (how?)
+- Handle multiple IPv4 adresses
+- How does FreeBSD mark DHCP addresses?

@@ -1,0 +1,829 @@
+#!/usr/bin/perl
+#
+# A script to perform smart GSSAPI-authentiated DDNS updates from
+# DHCP clients (or manually). It will try to update IPv4 & IPv6 forward
+# and reverse DNS pointers.
+#
+# Author: Peter Eriksson <peter.x.eriksson@liu.se>
+#
+#
+# Usage:
+#
+# NetworkManager:
+#   Create a script '90-ddns-update' in /etc/NetworkManager/dispatcher.d:
+#
+# DHCLIENT:
+#   Create a script 'ddns-update' in /etc/dhcp/dhclient-exit-hooks.d:
+#
+# The script:
+#   #!/bin/sh
+#   exec /sbin/pddnsc "$@"
+#
+
+use strict;
+use warnings;
+
+use POSIX;
+use Net::IP qw(ip_reverse ip_compress_address ip_expand_address);
+use Net::DNS;
+use Sys::Hostname;
+use Getopt::Std;
+use Time::Local;
+# use Data::Dumper;
+
+my $version = '2.5.1';
+my $author = 'Peter Eriksson <pen@lysator.liu.se>';
+
+my $f_domain;
+my $f_name;
+
+my $f_force = 0;
+my $f_debug = 0;
+my $f_verbose = 0;
+my $f_dnsdebug = 0;
+my $f_upddebug = 0;
+my $f_tcp = 0;
+my $f_update = 1;
+my $f_all = 0;
+
+my $f_host;
+my $f_source;
+
+my $f_ttl;
+my $d_ttl = 604800; # 1 week
+
+my $f_interface; # 'eno1'
+my $f_outlog;
+my $f_errlog;
+
+my $d_outlog = '/tmp/pddnsc.out';
+my $d_errlog = '/var/log/pddnsc';
+
+my $nsupdate = 'nsupdate';
+my $kinit = 'kinit';
+
+sub in_list {
+    my $o = shift;
+
+    foreach my $v (@_) {
+        return 1 if "$o" eq "$v";
+    }
+
+    return 0;
+}
+
+sub time_str2sec {
+    my $t = shift;
+
+    return $1    if $t =~ /^(\d+)\s*s?$/;
+    return 60*$1 if $t =~ /^(\d+)\s*m$/;
+    return 60*60*$1 if $t =~ /^(\d+)\s*h$/;
+    return 24*60*60*$1 if $t =~ /^(\d+)[dD]$/;
+    return 7*24*60*60*$1 if $t =~ /^(\d+)[wW]$/;
+    return 31*24*60*60*$1 if $t =~ /^(\d+)M$/;
+    return 365*24*60*60*$1 if $t =~ /^(\d+)[Y]$/;
+
+    my $t0 = time;
+
+    if ($t =~ /^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$/) {
+	my $t1 = timelocal($6, $5, $4, $3, $2-1, $1);
+	return $t1-$t0;
+    } 
+
+    if ($t =~ /^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})$/) {
+	my $t1 = timelocal(0, $5, $4, $3, $2-1, $1);
+	return $t1-$t0;
+    } 
+
+    if ($t =~ /^(\d{4})-(\d{2})-(\d{2})\s+(\d{2})$/) {
+	my $t1 = timelocal(0, 0, $4, $3, $2-1, $1);
+	return $t1-$t0;
+    } 
+
+    if ($t =~ /^(\d{4})-(\d{2})-(\d{2})$/) {
+	my $t1 = timelocal(0, 0, 0, $3, $2-1, $1);
+	return $t1-$t0;
+    }
+
+    my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime($t0);
+    $year += 1900;
+
+    if ($t =~ /^(\d{2}):(\d{2}):(\d{2})$/) {
+	my $t1 = timelocal($3, $2, $1, $mday, $mon, $year);
+	return $t1-$t0;
+    }
+
+    if ($t =~ /^(\d{2}):(\d{2})$/) {
+	my $t1 = timelocal(0, $2, $1, $mday, $mon, $year);
+	return $t1-$t0;
+    }
+}
+
+
+
+my %opts = ();
+getopts("ahdurvtfnoK:O:E:T:H:S:D:N:", \%opts);
+if (defined $opts{h}) {
+    print "[PDDNSC, v${version} - ${author}]\n";
+    print "\n";
+    print "Usage:\n  $0 [<options>] [<interface> [<reason>]]\n";
+    print "\n";
+    print "Options:\n";
+    print "  -h            Display this usage information\n";
+    print "  -v            Enable verbose output\n";
+    print "  -d            Enable debug output\n";
+    print "  -r            Enable DNS resolver debug output\n";
+    print "  -u            Enable DNS update debug output\n";
+    print "  -a            Select all global adresses (not just DHCP & SLAAC)\n";
+    print "  -f            Force update\n";
+    print "  -n            No update (dry run) mode\n";
+    print "  -t            Use TCP instead of UDP for updates\n";
+    print "  -o            Old-style Windows 2000-compatible GSS-TSIG\n";
+    print "  -O file       Output log file\n";
+    print "  -E file       Error log file\n";
+    print "  -T ttl        Default TTL\n";
+    print "  -D domain     Default domain\n";
+    print "  -N name       Force host name\n";
+    print "  -K key|file   Use TSIG instead of GSS-TSIG\n";
+    print "  -H host       Updates and DNS lookups via host\n";
+    print "  -S host       Force updates from host (local addr)\n";
+    exit 0;
+}
+
+$f_debug    = 1 if defined $opts{d};
+$f_dnsdebug = 1 if defined $opts{r};
+$f_upddebug = 1 if defined $opts{u};
+$f_verbose  = 1 if defined $opts{v};
+$f_update   = 0 if defined $opts{n};
+$f_force    = 1 if defined $opts{f};
+$f_tcp      = 1 if defined $opts{t};
+$f_all      = 1 if defined $opts{a};
+
+$f_host   = $opts{H} if defined $opts{H};
+$f_source = $opts{S} if defined $opts{S};
+$f_domain = $opts{D} if defined $opts{D};
+$f_name   = $opts{N} if defined $opts{N};
+
+if (defined $opts{T}) {
+    $f_ttl = time_str2sec($opts{T});
+    if (!defined $f_ttl || $f_ttl < 0) {
+	print STDERR "$0: Error: $opts{T}: Invalid time specification\n";
+	exit 1;
+    }
+}
+
+if (defined $opts{K}) {
+    if ($opts{K} ne '-') {
+	if ($opts{K} =~ /^\//) {
+	    $nsupdate .= ' -k'.$opts{K};
+	} else {
+	    $nsupdate .= ' -y'.$opts{K};
+	}
+    }
+    undef $kinit;
+} else {
+    if (defined $opts{o}) {
+        $nsupdate .= ' -o';
+    } else {
+        $nsupdate .= ' -g';
+    }
+}
+
+$f_outlog  = $opts{O} if defined $opts{O};
+$f_errlog  = $opts{E} if defined $opts{E};
+
+$f_outlog = $d_outlog if !defined $f_outlog && -f $d_outlog;
+$f_errlog = $d_errlog if !defined $f_errlog && -f $d_errlog;
+
+unless ($f_verbose) {
+    if (defined $f_outlog) {
+	open(STDOUT, '>>', $f_outlog);
+	print "\nARGS: ".join(' ', @ARGV)."\n";
+	system('date ; printenv');
+    } else {
+	open(STDOUT, '>', '/dev/null');
+    }
+    
+    if (defined $f_errlog) {
+	open(STDERR, '>>', $f_errlog);
+    } else {
+	open(STDERR, '>', '/dev/null');
+    }
+}
+
+my $mname = $f_host;
+my $mzone;
+
+my $res = new Net::DNS::Resolver( debug => $f_dnsdebug );
+$res->nameservers($f_host) if defined $f_host;
+
+sub ss {
+    my @rv;
+
+    foreach my $s (@_) {
+        push @rv, (defined $s ? ($s =~ /\s/ ? "\"$s\"" : "$s") : "");
+    }
+
+    return join(' ', @rv);
+}
+
+sub fqdn_lookup {
+    my $h = hostname;
+
+    while (my ($name, $aliases, $addrtype, $length, @addrs) = gethostent()) {
+        my @av = split(/\s+/, $aliases);
+
+        if ($name =~ /\./ && $name !~ /\.local$/ && $name !~ /\.localdomain$/) {
+            foreach my $a (@av) {
+                return $name if $h eq $a;
+            }
+        } elsif ($name eq $h) {
+            foreach my $a (@av) {
+                return $a if $a =~ /\./ && $name !~ /\.local$/ && $name !~ /\.localdomain$/;
+            }
+        }
+    }
+    return $h;
+}
+
+sub error {
+    my $rc = shift;
+    my $msg = join(' ', @_);
+
+    if ($rc > 0) {
+        print STDERR "$0: Error: ${msg}\n";
+        exit 0;
+    } elsif ($rc < 0) {
+        print STDERR "$0: Warning: ${msg}\n";
+        exit 0;
+    } else {
+        print STDERR "$0: Notice: ${msg}\n";
+    }
+}
+
+sub _dns_lookup {
+    my ( $name, $q ) = @_;
+    my @r;
+
+    my $dnsq = $res->search($name, $q);
+    return unless $dnsq;
+
+    foreach my $rr ($dnsq->answer) {
+	my $t = $rr->type;
+
+	next if defined $q && ($q ne 'ANY') && ($q ne $rr->type);
+
+        my $ttl = $rr->ttl;
+        my $class = $rr->class;
+        my $type = $rr->type;
+
+        if ($rr->type eq 'PTR') {
+            # Skip some names that SystemD lies about. Sigh.
+            next unless $rr->ptrdname =~ /\./;
+            next if $rr->ptrdname =~ /\.local$/;
+            push @r, "$ttl $class $type ".$rr->ptrdname;
+        } elsif ($rr->type eq 'CNAME') {
+            push @r, "$ttl $class $type ".$rr->cname;
+        } elsif ($rr->type eq 'TXT') {
+            push @r, "$ttl $class $type ".$rr->txtdata;
+        } elsif ($rr->type eq 'SOA') {
+            push @r, $rr->mname;
+        } elsif ($rr->type eq 'A' || $rr->type eq 'AAAA') {
+            push @r, "$ttl $class $type ".$rr->address;
+        }
+    }
+
+    return @r;
+}
+
+sub dns_lookup {
+    my ( $name, $q ) = @_;
+
+    if ($name =~ /^\d+\.\d+\.\d+\.\d+$/ || 
+        $name =~ /^[0-9a-f:]+$/ && $name =~ /:/) {
+
+	$name = ip_reverse($name);
+	$q = 'PTR' unless defined $q;
+
+    } elsif ($name =~ /\.in-addr\.arpa\.?$/ ||
+             $name =~ /\.ip6\.arpa\.?$/) {
+
+        $q = 'PTR' unless defined $q;
+
+    }
+
+    return _dns_lookup($name, $q) if defined $q;
+    return (_dns_lookup($name, 'A'), _dns_lookup($name, 'AAAA'));
+}
+
+sub dns_update_delete {
+    my ($name, $type, $ip) = @_;
+
+    print STDERR "    nsupdate(delete ${name}/${type}/${ip})\n" if $f_debug;
+
+    open(my $fh, '|-', ($f_update ? $nsupdate.($f_tcp ? " -v" : "") : 'cat'.($f_upddebug ? '' : ' >/dev/null')) ) || error(1, "nsupdate(delete): Exec failed: $!");
+
+    print $fh "server ${mname}\n" if defined $mname;
+    print $fh "local ${f_source}\n" if defined $f_source;
+
+    if ($type eq 'PTR') {
+	my $revip = ip_reverse($ip);
+	print $fh "update delete ${revip} IN ${type} ${name}.\n";
+	print $fh "send\n";
+    } else {
+	print $fh "update delete ${name} IN ${type} ${ip}\n";
+	print $fh "send\n";
+    }
+
+    close($fh);
+    my $rc = $?;
+    error(0, "nsupdate(delete ${name}/${type}/${ip}): Failed (".exitcode2str($rc)."): $!") if $rc != 0;
+}
+
+sub dns_update_add {
+    my ($name, $ttl, $type, $ip) = @_;
+
+    $ttl = $d_ttl unless defined $ttl;
+    print STDERR "    nsupdate(add ${name}/${ttl}/${type}/${ip})\n" if $f_debug;
+
+    open(my $fh, '|-', ($f_update ? $nsupdate.($f_tcp ? " -v" : "") : "cat".($f_upddebug ? '' : ' >/dev/null'))) || error(1, "nsupdate(add): Exec failed: $!");
+    
+    print $fh "server ${mname}\n" if defined $mname;
+    print $fh "local ${f_source}\n" if defined $f_source;
+
+    if ($type eq 'PTR') {
+	my $revip = ip_reverse($ip);
+	print $fh "update add ${revip} ${ttl} IN ${type} ${name}.\n";
+	print $fh "send\n";
+    } else {
+	print $fh "update add ${name} ${ttl} IN ${type} ${ip}\n";
+	print $fh "send\n";
+    }
+
+    close($fh);
+    my $rc = $?;
+    error(0, "nsupdate(add ${name}/${ttl}/${type}/${ip}): Failed (".exitcode2str($rc)."): $!") if $rc != 0;
+}
+
+# ip -4 route list
+# default via 10.245.96.1 dev eno1 
+sub get_ipv4_public_interface {
+    if (-x '/sbin/ip') {
+	# Linux:
+	# default via 130.236.16.1 dev eno1 proto dhcp metric 100
+	
+	my @output = `/sbin/ip -4 route show`;
+	chomp(@output);
+	
+	foreach my $s (@output) {
+	    return $1 if $s =~ /^default\s+via\s+\d+\.\d+\.\d+\.\d+\s+dev\s+(\S+)/;
+	}
+    } else {
+	# Solaris & FreeBSD:
+
+	my @output = `route get -inet default`;
+	chomp(@output);
+    
+	foreach my $s (@output) {
+	    return $1 if $s =~ /^\s*interface:\s+(\S+)$/
+	}
+    }
+}
+
+# ip -6 route show
+# default via fe80::669e:f3ff:fe6b:86bf dev eno1 proto ra metric 1024 expires 1786sec hoplimit 64 pref medium
+sub get_ipv6_public_interface {
+    if (-x '/sbin/ip') {
+	# Linux:
+	
+	my @output = `/sbin/ip -6 route show`;
+	chomp(@output);
+	
+	foreach my $s (@output) {
+	    return $1 if $s =~ /^default\s+via\s+\S+\s++dev\s+(\S+)/;
+	}
+    } else {
+	# Solaris & FreeBSD:
+
+	my @output = `route get -inet6 default`;
+	chomp(@output);
+    
+	foreach my $s (@output) {
+	    return $1 if $s =~ /^\s*interface:\s+(\S+)$/
+	}
+    }
+}
+
+
+# Linux:
+#
+# ip addr show dev eno1
+# 2: eno1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP group default qlen 1000
+#     link/ether c0:3f:d5:66:c5:1f brd ff:ff:ff:ff:ff:ff
+#     inet 10.245.99.234/22 brd 10.245.99.255 scope global dynamic eno1
+#        valid_lft 499675sec preferred_lft 499675sec
+#     inet6 2001:6b0:17:a803:2000::8926/64 scope global deprecated dynamic 
+#        valid_lft 528529sec preferred_lft 0sec
+#     inet6 fe80::c23f:d5ff:fe66:c51f/64 scope link 
+#        valid_lft forever preferred_lft forever
+
+sub get_ipv4_public_address {
+    my $interface = shift;
+    return unless defined $interface;
+
+    if (-x '/sbin/ip') {
+	my @output = `/sbin/ip -4 addr show dev $interface`;
+	foreach my $s (@output) {
+	    if ($s =~ /\s*inet\s+(\d+\.\d+\.\d+\.\d+)/) {
+		my $a = $1;
+		return ip_compress_address($a, 4) unless $a eq '127.0.0.1';
+	    }
+	}
+    } else {
+	my @output = `/sbin/ifconfig $interface inet`;
+	chomp(@output);
+	foreach my $s (@output) {
+	    if ($s =~ /\s*inet\s+(\d+.\.\d+.\.\d+.\.\d+)/) {
+		my $a = $1;
+		return ip_compress_address($a, 4) unless $a eq '127.0.0.1';
+	    }
+	}
+    }
+}
+
+sub get_ipv6_public_addresses {
+    my $interface = shift;
+    return unless defined $interface;
+
+    my @slaacv;
+    my @dhcpv;
+    
+    if (-x '/sbin/ip') {
+	my @output = `/sbin/ip -6 addr show dev $interface`;
+	foreach my $s (@output) {
+	    if ($s =~ /\s*inet6\s+([0-9a-f:]+).*scope\s+global/) {
+		my $a = $1;
+
+		# Only bother with SLAAC (mngtmpaddr) or DHCPv6 (dynamic) addresses
+                if ($f_all) {
+                    push @dhcpv, $a;
+                } elsif ($s =~ /mngtmpaddr/) {
+                    push @slaacv, $a;
+                } elsif ($s =~ /dynamic/) {
+                    push @dhcpv, $a;
+                }
+	    }
+	}
+    } else {
+	my @output = `/sbin/ifconfig -a inet6`;
+	chomp(@output);
+
+	# Solaris:
+	# lo0: flags=2002000849<UP,LOOPBACK,RUNNING,MULTICAST,IPv6,VIRTUAL> mtu 8252 index 1
+        # 	inet6 ::1/128 
+	# e1000g0: flags=20002004841<UP,RUNNING,MULTICAST,DHCP,IPv6> mtu 1500 index 2
+        # 	inet6 fe80::c23f:d5ff:fe63:aa39/10 
+	# e1000g0:1: flags=20002080841<UP,RUNNING,MULTICAST,ADDRCONF,IPv6> mtu 1500 index 2
+        # 	inet6 2001:6b0:17:f002:c23f:d5ff:fe63:aa39/64 
+	# e1000g0:2: flags=20002004841<UP,RUNNING,MULTICAST,DHCP,IPv6> mtu 1500 index 2
+        # 	inet6 2001:6b0:17:f002:1000::998/128 
+	#
+	# FreeBSD:
+	# em0: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> metric 0 mtu 1500
+	# 	options=81249b<RXCSUM,TXCSUM,VLAN_MTU,VLAN_HWTAGGING,VLAN_HWCSUM,LRO,WOL_MAGIC,VLAN_HWFILTER>
+	# 	inet6 fe80::c23f:d5ff:fe66:bf0a%em0 prefixlen 64 scopeid 0x1
+	# 	inet6 2001:6b0:17:f002:c23f:d5ff:fe66:bf0a prefixlen 64 autoconf
+	# 	nd6 options=23<PERFORMNUD,ACCEPT_RTADV,AUTO_LINKLOCAL>
+
+	my ($cif, $t);
+	foreach my $s (@output) {
+	    if ($s =~ /^([a-z][a-z0-9]*[0-9]+):.*\s+flags=\d+<UP.*,(ADDRCONF|DHCP),/) {
+		# Solaris
+		$cif = $1;
+		$t = $2;
+	    } elsif ($s =~ /^([a-z][a-z0-9]*[0-9]+):.*\s+flags=\d+<UP,/) {
+		# FreeBSD
+		$cif = $1;
+		undef $t;
+	    }
+
+	    next unless defined $cif;
+	    next unless $cif eq $interface;
+
+	    if ($s =~ /\s*inet6\s+([0-9a-f:]+)/) {
+		my $a = $1;
+		# XXX: FIXME: How are FreeBSD DHCPv6 addresses marked?
+		$t = $1 if $s =~ /\s(autoconf)/;
+
+		# Ignore local-link addresses
+		next if $a =~ /^fe80::/;
+		
+		# Ignore statically defined interfaces
+		next unless defined $t;
+		
+		# Only bother the SLAAC (ADDRCONF/autoconf) or DHCPv6 (DHCP) addresses
+                if ($f_all || $t eq 'DHCP') {
+                    push @dhcpv, $a;
+                } elsif ($t eq 'ADDRCONF' || $t eq 'autoconf') {
+                    push @slaacv, $a;
+                }
+	    }
+	}
+    }
+
+    # Prioritize DHCPv6 over SLAAC addresses
+    return (@dhcpv, @slaacv);
+}
+
+
+# Find the SOA master for the zone containing the fqdn
+sub soa_lookup {
+    my $fqdn = shift;
+
+    while ($fqdn =~ /^[^\.]+\.(.+)$/) {
+        $fqdn = $1;
+
+        my @m = _dns_lookup($fqdn, 'SOA');
+        return ($m[0], $fqdn) if @m >= 1;
+    }
+}
+
+
+my $hname;
+my $pname;
+my $fqdn;
+
+if (defined $f_name) {
+    $fqdn = $f_name;
+} else {
+    $fqdn = fqdn_lookup();
+}
+
+$fqdn .= ".${f_domain}" if defined $f_domain && $fqdn !~ /\./;
+
+$hname = $fqdn;
+$hname = $1 if $fqdn =~ /^([^\.]+)\./;
+$pname = (uc $hname).'$';
+
+
+# unless (defined $f_host) {
+#    my ($mname, $mdom) = soa_lookup($fqdn);
+#    if (defined $mname) {
+#        print "USING master DNS server: ${mname}\n";
+#        $res->nameservers($mname);
+#        $f_host = $mname;
+#    }
+# }
+
+my $kcfile = "/tmp/krb5cc_ddns.$$";
+$ENV{KRB5CCNAME} = $kcfile;
+
+END {
+    unlink($kcfile) if defined $kcfile;
+}
+
+sub exitcode2str {
+    my $rc = shift;
+
+    return "Unknown" unless defined $rc;
+
+    my $ec = ($rc >> 8);
+    my $sig = ($rc & 255);
+
+    return "Signal $sig" if $sig;
+    return "Code $ec";
+}
+
+my ($if4, $if6, $ttl4, $ttl6, $ipv4, $ipv6);
+my ($dhcp4_hostname, $dhcp4_domain);
+my @ipv4v;
+my @ipv6v;
+
+my $reason = $ENV{'reason'};
+if (defined $reason) {
+# DHCLIENT environment variables
+
+    $if4 = $if6 = $ENV{'interface'};
+    my $medium  = $ENV{'medium'};
+
+    $ipv4 = $ENV{'new_ip_address'};
+    $ttl4 = $ENV{'new_dhcp_lease_time'};
+
+    $dhcp4_hostname = $ENV{'new_host_name'};
+    $dhcp4_domain   = $ENV{'new_domain_name'};
+
+    $ipv6 = $ENV{'new_ip6_address'};
+    $ttl6 = $ENV{'new_preferred_life'} || $ENV{'new_max_life'};
+
+} else {
+# Network Manager environment variables & command line arguments
+
+    $ipv4           = $ENV{'DHCP4_IP_ADDRESS'};
+    $ttl4           = $ENV{'DHCP4_DHCP_LEASE_TIME'};
+
+    $dhcp4_hostname = $ENV{'DHCP4_HOST_NAME'};
+    $dhcp4_domain   = $ENV{'DHCP4_DOMAIN_NAME'};
+
+    $ipv6           = $ENV{'DHCP6_IP6_ADDRESS'};
+    $ttl6           = $ENV{'DHCP6_PREFERRED_LIFE'} || $ENV{'DHCP6_MAX_LIFE'};
+
+    $if4 = $if6 = $ARGV[0];
+
+    $reason = $ARGV[1];
+    if (!defined $reason || $reason eq '') {
+	$reason = "update";
+    }
+
+}
+
+# Try to get the current interface settings if not specified
+if (!defined $if4 || $if4 eq '') {
+    $if4  = get_ipv4_public_interface();
+    undef $if4 if defined $if4 && $if4 eq '';
+    $ipv4 = get_ipv4_public_address($if4);
+    undef $ipv4 if defined $ipv4 && $ipv4 eq '';
+}
+
+if (!defined $if6 || $if6 eq '') {
+    $if6  = get_ipv4_public_interface();
+    undef $if6 if defined $if6 && $if6 eq '';
+
+    @ipv6v = get_ipv6_public_addresses($if6);
+    
+    # FIXME: Handle multiple public IPv6 addresses
+    $ipv6 = $ipv6v[0] if @ipv6v >= 1;
+    error(0, "Multiple public IPv6 addresses - using $ipv6") if @ipv6v > 1;
+#    undef $ipv6 if defined $ipv6 && $ipv6 eq '';
+}
+
+# Use the DHCP domain if available and we haven't selected another domain.
+# XXX: Use a list of names instead
+$fqdn = "${hname}.${dhcp4_domain}" if defined $dhcp4_domain && $fqdn !~ /\./;
+
+error(1, "${fqdn}: Invalid domain name") if $fqdn !~ /\./ || $fqdn =~ /.local$/ || $fqdn =~ /.localdomain$/;
+
+sub p_ttl {
+    my $ttl = shift;
+
+    $ttl = $f_ttl if defined $f_ttl;
+    return "" unless defined $ttl;
+    return "(${ttl})";
+}
+
+
+print STDERR strftime("%F %T", localtime time)." : ".ss($reason)." : ".ss($fqdn);
+print STDERR " : ".ss($ipv4).p_ttl($ttl4)." : ".ss(join(',', @ipv6v)).p_ttl($ttl6)."\n";
+
+exit 0 unless defined $reason && $reason =~ /^(up|update|dhcp\d-change|BOUND6?|RENEW6?|REBIND6?|REBOOT6?)$/;
+
+
+if (defined $kinit) {
+    my $rc;
+    my $kres = `${kinit} -k ${pname} 2>&1`;
+    $rc = $?;
+    error(1, "'${kinit} -k ${pname}' failed (".exitcode2str($rc)."):\n  ${kres}") if $rc != 0;
+}
+
+my $found;
+
+unless (defined $f_host) {
+    ($mname, $mzone) = soa_lookup($fqdn);
+    if (defined $mname) {
+        $res->nameservers($mname);
+    }
+}
+
+
+print STDERR "  name = $fqdn : master = ".ss($mname)." : zone = ".ss($mzone)."\n" if $f_debug;
+
+# IPv4 Name -> A
+my @a4v = dns_lookup($fqdn, 'A');
+$found = 0;
+my $s_ttl4 = $ttl4;
+
+foreach my $rr (@a4v) {
+    my ($ottl, $oip) = ($1, $2) if $rr =~ /^(\d+)\s+IN\s+A\s+(\S+)$/;
+    next unless defined $ottl && defined $oip;
+
+    print STDERR "\tipv4 = $oip : ttl = $ottl\n" if $f_debug;
+    if (defined $ipv4 && ip_compress_address($oip, 4) eq $ipv4) {
+        $ttl4 = $ottl unless defined $ttl4;
+        unless ($f_force) {
+            $found = 1;
+            next;
+        }
+    }
+    print "${fqdn}: ${oip}: Removing stale IPv4 address\n" if $f_verbose;
+    dns_update_delete($fqdn, 'A', $oip);
+}
+if (defined $ipv4 && !$found) {
+    print "${fqdn}: ${ipv4}: Adding IPv4 address\n" if $f_verbose;
+    dns_update_add($fqdn, (defined $f_ttl ? $f_ttl : $ttl4), 'A', $ipv4) 
+}
+
+
+# IPv6 Name -> AAAA
+my @a6v = dns_lookup($fqdn, 'AAAA');
+my $s_ttl6 = $ttl6;
+my @found_ipv6v;
+
+foreach my $rr (@a6v) {
+    my ($ottl, $oip) = ($1, $2) if $rr =~ /^(\d+)\s+IN\s+AAAA\s+(\S+)$/;
+    next unless defined $ottl && defined $oip;
+
+    $oip = ip_compress_address($oip, 6);
+    print STDERR "\tipv6 = $oip : ttl = $ottl\n" if $f_debug;
+    if (@ipv6v > 0 && in_list($oip, @ipv6v)){
+	$ttl6 = $ottl unless defined $ttl6;
+	unless ($f_force) {
+            push @found_ipv6v, $oip;
+	    next;
+	}
+    }
+    print "${fqdn}: ${oip}: Removing stale IPv6 address\n" if $f_verbose;
+    dns_update_delete($fqdn, 'AAAA', $oip);
+}
+
+foreach my $ip (@ipv6v) {
+    unless (in_list($ip, @found_ipv6v)) {
+        print "${fqdn}: ${ipv6}: Adding IPv6 address\n" if $f_verbose;
+        dns_update_add($fqdn, (defined $f_ttl ? $f_ttl : $ttl6), 'AAAA', $ipv6);
+    }
+}
+    
+
+
+# IPv4 -> Name
+if (defined $ipv4) {
+    unless (defined $f_host) {
+        my $rip = ip_reverse($ipv4);
+        ($mname, $mzone) = soa_lookup($rip);
+        if (defined $mname) {
+            $res->nameservers($mname);
+        }
+    }
+
+    print STDERR "  ipv4 = ${ipv4} : master = ".ss($mname)." : zone = ".ss($mzone)."\n" if $f_debug;
+    my @rv = dns_lookup($ipv4, 'PTR'); # ipv4 -> fqdn
+    
+    my $ttl4 = $s_ttl4;
+    $found = 0;
+    foreach my $rr (@rv) {
+	my ($ottl, $oname) = ($1, $2) if $rr =~ /^(\d+)\s+IN\s+PTR\s+(\S+)\.?$/;
+	print STDERR "\tname = $oname : ttl = $ottl\n" if $f_debug;
+	
+	next unless defined $ottl && defined $oname;
+	if ($oname eq $fqdn) {
+	    $ttl4 = $ottl unless defined $ttl4;
+	    unless ($f_force) {
+		$found = 1;
+		next;
+	    }
+	}
+	print "${ipv4}: ${oname}: Removing stale IPv4 name\n" if $f_verbose;
+	dns_update_delete($oname, 'PTR', $ipv4)
+    }
+    unless ($found) {
+	print "${ipv4}: ${fqdn}: Adding IPv4 name\n" if $f_verbose;
+	dns_update_add($fqdn, (defined $f_ttl ? $f_ttl : $ttl4), 'PTR', $ipv4);
+    }
+}
+
+
+# IPv6 -> Name
+if (defined $ipv6) {
+    unless (defined $f_host) {
+        my $rip = ip_reverse($ipv6);
+        ($mname, $mzone) = soa_lookup($rip);
+        if (defined $mname) {
+            $res->nameservers($mname);
+        }
+    }
+    
+    print STDERR "  ipv6 = ${ipv6} : master = ".ss($mname)." : zone = ".ss($mzone)."\n" if $f_debug;
+    my @rv = dns_lookup($ipv6, 'PTR');  # ipv6 -> fqdn
+    
+    $ttl6 = $s_ttl6;
+    $found = 0;
+    foreach my $rr (@rv) {
+	my ($ottl, $oname) = ($1, $2) if $rr =~ /^(\d+)\s+IN\s+PTR\s+(\S+)\.?$/;
+	print STDERR "\tname = $oname : ttl = $ottl\n" if $f_debug;
+	
+	next unless defined $ottl && defined $oname;
+	if ($oname eq $fqdn) {
+	    $ttl6 = $ottl unless defined $ttl6;
+	    unless ($f_force) {
+		$found = 1;
+		next;
+	    }
+	}
+	print "${ipv6}: ${oname}: Removing stale IPv6 name\n" if $f_verbose;
+	dns_update_delete($oname, 'PTR', $ipv6)
+    }
+    unless ($found) {
+	print "${ipv6}: ${fqdn}: Adding IPv6 name\n" if $f_verbose;
+	dns_update_add($fqdn, (defined $f_ttl ? $f_ttl : $ttl6), 'PTR', $ipv6);
+    }
+}
+
+exit 0;
