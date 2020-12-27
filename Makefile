@@ -31,7 +31,7 @@ install-deps-FreeBSD:
 	pkg install bind-tools
 
 
-APTPKGS=libnet-ip-perl
+APTPKGS=libnet-ip-perl libnet-dns-perl
 
 install-deps-Linux:
 	@test -f /usr/bin/apt && apt install -y $(APTPKGS)
