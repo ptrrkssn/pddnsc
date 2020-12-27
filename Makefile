@@ -12,7 +12,7 @@ all:
 	@echo "Valid make targets: clean, push and install" ; exit 1
 
 clean:
-	-rm -f *~ \#*
+	-@find . -type f -a \( -name '*~' -o -name '\#*' \) -print0 | xargs -0 rm -vf
 
 push:	clean
 	git add -A && git commit -a && git push
