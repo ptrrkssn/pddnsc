@@ -41,6 +41,7 @@ install-deps-Linux:
 	fi
 
 install-deps-Darwin:
+	perl -MCPAN -e 'install Net::IP'
 	@echo Nothing to do
 
 install-deps-SunOS:
