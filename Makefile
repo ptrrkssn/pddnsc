@@ -28,7 +28,7 @@ install:
 	test -d $DHDIR && cp script.sh $DHDIR/ddns-update
 
 install-deps:
-	$(MAKE) install-deps-`uname -s`
+	@$(MAKE) install-deps-`uname -s`
 
 install-deps-FreeBSD:
 	pkg install $(BSDPKGS)
@@ -49,4 +49,5 @@ install-deps-SunOS:
 	perl -MCPAN -e 'install Sys::Hostname::Long'
 
 check:
+	perl -cw pddnsc
 	./pddnsc -h

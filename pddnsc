@@ -31,7 +31,7 @@ use Getopt::Std;
 use Time::Local;
 # use Data::Dumper;
 
-my $version = '2.5.1';
+my $version = '2.6.0';
 my $author = 'Peter Eriksson <pen@lysator.liu.se>';
 
 my $f_domain;
@@ -50,7 +50,8 @@ my $f_host;
 my $f_source;
 
 my $f_ttl;
-my $d_ttl = 604800; # 1 week
+my $f_minttl = 7200; # 2 hours
+my $d_ttl = 604800;  # 1 week
 
 my $f_interface; # 'eno1'
 my $f_outlog;
@@ -122,7 +123,7 @@ sub time_str2sec {
 
 
 my %opts = ();
-getopts("ahdurvtfnoK:O:E:T:H:S:D:N:", \%opts);
+getopts("ahdurvtfnoK:O:E:T:H:S:D:N:M:", \%opts);
 if (defined $opts{h}) {
     print "[PDDNSC, v${version} - ${author}]\n";
     print "\n";
@@ -142,6 +143,7 @@ if (defined $opts{h}) {
     print "  -O file       Output log file\n";
     print "  -E file       Error log file\n";
     print "  -T ttl        Default TTL\n";
+    print "  -M ttl        Min TTL before forcing update\n";
     print "  -D domain     Default domain\n";
     print "  -N name       Force host name\n";
     print "  -K key|file   Use TSIG instead of GSS-TSIG\n";
@@ -167,7 +169,15 @@ $f_name   = $opts{N} if defined $opts{N};
 if (defined $opts{T}) {
     $f_ttl = time_str2sec($opts{T});
     if (!defined $f_ttl || $f_ttl < 0) {
-	print STDERR "$0: Error: $opts{T}: Invalid time specification\n";
+	print STDERR "$0: Error: $opts{T}: Invalid TTL time specification\n";
+	exit 1;
+    }
+}
+
+if (defined $opts{M}) {
+    $f_minttl = time_str2sec($opts{M});
+    if (!defined $f_minttl || $f_minttl < 0) {
+	print STDERR "$0: Error: $opts{M}: Invalid min TTL time specification\n";
 	exit 1;
     }
 }
@@ -662,17 +672,8 @@ $fqdn = "${hname}.${dhcp4_domain}" if defined $dhcp4_domain && $fqdn !~ /\./;
 
 error(1, "${fqdn}: Invalid domain name") if $fqdn !~ /\./ || $fqdn =~ /.local$/ || $fqdn =~ /.localdomain$/;
 
-sub p_ttl {
-    my $ttl = shift;
 
-    $ttl = $f_ttl if defined $f_ttl;
-    return "" unless defined $ttl;
-    return "(${ttl})";
-}
-
-
-print STDERR strftime("%F %T", localtime time)." : ".ss($reason)." : ".ss($fqdn);
-print STDERR " : ".ss($ipv4).p_ttl($ttl4)." : ".ss(join(',', @ipv6v)).p_ttl($ttl6)."\n";
+print STDERR strftime("%F %T", localtime time)." : ".ss($reason)." : ".ss($fqdn, $ttl4, $ipv4, $ttl6, $ipv6)."\n";
 
 exit 0 unless defined $reason && $reason =~ /^(up|update|dhcp\d-change|BOUND6?|RENEW6?|REBIND6?|REBOOT6?)$/;
 
@@ -693,25 +694,25 @@ unless (defined $f_host) {
     }
 }
 
-
-print STDERR "  name = $fqdn : master = ".ss($mname)." : zone = ".ss($mzone)."\n" if $f_debug;
-
 # IPv4 Name -> A
-my @a4v = dns_lookup($fqdn, 'A');
+print STDERR "  fqdn=$fqdn : dns=".ss($mname)." : ipv4=".ss($ipv4)." : ipv6=".ss(join(',', @ipv6v))."\n" if $f_debug;
+
+my @a4v = dns_lookup($fqdn, 'A');   # fqdn -> ipv4
+
 $found = 0;
 my $s_ttl4 = $ttl4;
 
 foreach my $rr (@a4v) {
     my ($ottl, $oip) = ($1, $2) if $rr =~ /^(\d+)\s+IN\s+A\s+(\S+)$/;
+    print STDERR "\tipv4: ottl = $ottl, oip = $oip\n" if $f_debug;
+    
     next unless defined $ottl && defined $oip;
-
-    print STDERR "\tipv4 = $oip : ttl = $ottl\n" if $f_debug;
     if (defined $ipv4 && ip_compress_address($oip, 4) eq $ipv4) {
-        $ttl4 = $ottl unless defined $ttl4;
-        unless ($f_force) {
-            $found = 1;
-            next;
-        }
+	$ttl4 = $ottl unless defined $ttl4;
+	if (!$f_force && !(defined $f_minttl && $ottl < $f_minttl)) {
+	    $found = 1;
+	    next;
+	}
     }
     print "${fqdn}: ${oip}: Removing stale IPv4 address\n" if $f_verbose;
     dns_update_delete($fqdn, 'A', $oip);
@@ -723,20 +724,21 @@ if (defined $ipv4 && !$found) {
 
 
 # IPv6 Name -> AAAA
-my @a6v = dns_lookup($fqdn, 'AAAA');
-my $s_ttl6 = $ttl6;
-my @found_ipv6v;
+my @a6v = dns_lookup($fqdn, 'AAAA'); # fqdn -> ipv6
 
+$found = 0;
+my $s_ttl6 = $ttl6;
+
+my @ipv6vf;
 foreach my $rr (@a6v) {
     my ($ottl, $oip) = ($1, $2) if $rr =~ /^(\d+)\s+IN\s+AAAA\s+(\S+)$/;
+    print STDERR "\tipv6: ottl = $ottl, oip = $oip\n" if $f_debug;
     next unless defined $ottl && defined $oip;
-
     $oip = ip_compress_address($oip, 6);
-    print STDERR "\tipv6 = $oip : ttl = $ottl\n" if $f_debug;
     if (@ipv6v > 0 && in_list($oip, @ipv6v)){
 	$ttl6 = $ottl unless defined $ttl6;
-	unless ($f_force) {
-            push @found_ipv6v, $oip;
+	if (!$f_force && !(defined $f_minttl && $ottl < $f_minttl)) {
+            push @ipv6vf, $oip;
 	    next;
 	}
     }
@@ -745,7 +747,7 @@ foreach my $rr (@a6v) {
 }
 
 foreach my $ip (@ipv6v) {
-    unless (in_list($ip, @found_ipv6v)) {
+    unless (in_list($ip, @ipv6vf)) {
         print "${fqdn}: ${ipv6}: Adding IPv6 address\n" if $f_verbose;
         dns_update_add($fqdn, (defined $f_ttl ? $f_ttl : $ttl6), 'AAAA', $ipv6);
     }
@@ -763,19 +765,19 @@ if (defined $ipv4) {
         }
     }
 
-    print STDERR "  ipv4 = ${ipv4} : master = ".ss($mname)." : zone = ".ss($mzone)."\n" if $f_debug;
+    print STDERR "  ipv4=${ipv4}: dns=".ss($mname).", name=${fqdn}\n" if $f_debug;
     my @rv = dns_lookup($ipv4, 'PTR'); # ipv4 -> fqdn
     
     my $ttl4 = $s_ttl4;
     $found = 0;
     foreach my $rr (@rv) {
 	my ($ottl, $oname) = ($1, $2) if $rr =~ /^(\d+)\s+IN\s+PTR\s+(\S+)\.?$/;
-	print STDERR "\tname = $oname : ttl = $ottl\n" if $f_debug;
+	print STDERR "\tipv4: ottl = $ottl, oname = $oname\n" if $f_debug;
 	
 	next unless defined $ottl && defined $oname;
 	if ($oname eq $fqdn) {
 	    $ttl4 = $ottl unless defined $ttl4;
-	    unless ($f_force) {
+	    if (!$f_force && !(defined $f_minttl && $ottl < $f_minttl)) {
 		$found = 1;
 		next;
 	    }
@@ -800,19 +802,19 @@ if (defined $ipv6) {
         }
     }
     
-    print STDERR "  ipv6 = ${ipv6} : master = ".ss($mname)." : zone = ".ss($mzone)."\n" if $f_debug;
+    print STDERR "  ipv6=${ipv6}: dns=".ss($mname).", name=${fqdn}\n" if $f_debug;
     my @rv = dns_lookup($ipv6, 'PTR');  # ipv6 -> fqdn
     
     $ttl6 = $s_ttl6;
     $found = 0;
     foreach my $rr (@rv) {
 	my ($ottl, $oname) = ($1, $2) if $rr =~ /^(\d+)\s+IN\s+PTR\s+(\S+)\.?$/;
-	print STDERR "\tname = $oname : ttl = $ottl\n" if $f_debug;
+	print STDERR "\tipv6: ottl = $ottl, oname = $oname\n" if $f_debug;
 	
 	next unless defined $ottl && defined $oname;
 	if ($oname eq $fqdn) {
 	    $ttl6 = $ottl unless defined $ttl6;
-	    unless ($f_force) {
+	    if (!$f_force && !(defined $f_minttl && $ottl < $f_minttl)) {
 		$found = 1;
 		next;
 	    }
