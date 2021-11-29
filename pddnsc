@@ -17,7 +17,14 @@
 #
 # The script:
 #   #!/bin/sh
-#   exec /sbin/pddnsc "$@"
+#   exec /sbin/pddnsc -f "$@"
+#
+# The "-f" flag is optional, it forces the DNS records to always be
+# updated at DHCP renewals - this might be useful if you DNS server uses
+# "scavenging" to delete unused records.
+#
+# The script can also be run regularily from cron "just in case":
+#   0 * * * * /sbin/pddnsc -vd >/var/log/pddns-cron.log 2>&1
 #
 
 use strict;

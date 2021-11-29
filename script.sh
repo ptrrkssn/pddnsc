@@ -1,2 +1,2 @@
 #!/bin/sh
-exec /sbin/pddnsc "$@"
+exec /sbin/pddnsc -f "$@"
