@@ -31,7 +31,7 @@ use Getopt::Std;
 use Time::Local;
 # use Data::Dumper;
 
-my $version = '2.6.0';
+my $version = '2.6.3';
 my $author = 'Peter Eriksson <pen@lysator.liu.se>';
 
 my $f_domain;
@@ -125,7 +125,7 @@ sub time_str2sec {
 my %opts = ();
 getopts("ahdurvtfnoK:O:E:T:H:S:D:N:M:", \%opts);
 if (defined $opts{h}) {
-    print "[PDDNSC, v${version} - ${author}]\n";
+    print "[pddnsc, v${version} - ${author}]\n";
     print "\n";
     print "Usage:\n  $0 [<options>] [<interface> [<reason>]]\n";
     print "\n";
@@ -142,8 +142,8 @@ if (defined $opts{h}) {
     print "  -o            Old-style Windows 2000-compatible GSS-TSIG\n";
     print "  -O file       Output log file\n";
     print "  -E file       Error log file\n";
-    print "  -T ttl        Default TTL\n";
-    print "  -M ttl        Min TTL before forcing update\n";
+    print "  -T ttl        Default TTL [${d_ttl}]\n";
+    print "  -M ttl        Min TTL before forcing update [${f_minttl}]\n";
     print "  -D domain     Default domain\n";
     print "  -N name       Force host name\n";
     print "  -K key|file   Use TSIG instead of GSS-TSIG\n";
@@ -613,7 +613,16 @@ my $reason = $ENV{'reason'};
 if (defined $reason) {
 # DHCLIENT environment variables
 
-    $if4 = $if6 = $ENV{'interface'};
+    if ($reason =~ /^(BOUND|RENEW|REBIND|REBOOT)/) {
+	if ($reason =~ /6$/) {
+	    $if6 = $ENV{'interface'};
+	} else {
+	    $if4 = $ENV{'interface'};
+	}
+    } else {
+	$if4 = $if6 = $ENV{'interface'};
+    }
+
     my $medium  = $ENV{'medium'};
 
     $ipv4 = $ENV{'new_ip_address'};
@@ -624,6 +633,7 @@ if (defined $reason) {
 
     $ipv6 = $ENV{'new_ip6_address'};
     $ttl6 = $ENV{'new_preferred_life'} || $ENV{'new_max_life'};
+    push @ipv6v, $ipv6 if defined $ipv6;
 
 } else {
 # Network Manager environment variables & command line arguments
@@ -635,6 +645,8 @@ if (defined $reason) {
     $dhcp4_domain   = $ENV{'DHCP4_DOMAIN_NAME'};
 
     $ipv6           = $ENV{'DHCP6_IP6_ADDRESS'};
+    push @ipv6v, $ipv6 if defined $ipv6;
+
     $ttl6           = $ENV{'DHCP6_PREFERRED_LIFE'} || $ENV{'DHCP6_MAX_LIFE'};
 
     $if4 = $if6 = $ARGV[0];
@@ -717,7 +729,7 @@ foreach my $rr (@a4v) {
     print "${fqdn}: ${oip}: Removing stale IPv4 address\n" if $f_verbose;
     dns_update_delete($fqdn, 'A', $oip);
 }
-if (defined $ipv4 && !$found) {
+if (defined $ipv4 && (!$found || $f_force)) {
     print "${fqdn}: ${ipv4}: Adding IPv4 address\n" if $f_verbose;
     dns_update_add($fqdn, (defined $f_ttl ? $f_ttl : $ttl4), 'A', $ipv4) 
 }
@@ -748,8 +760,8 @@ foreach my $rr (@a6v) {
 
 foreach my $ip (@ipv6v) {
     unless (in_list($ip, @ipv6vf)) {
-        print "${fqdn}: ${ipv6}: Adding IPv6 address\n" if $f_verbose;
-        dns_update_add($fqdn, (defined $f_ttl ? $f_ttl : $ttl6), 'AAAA', $ipv6);
+	print "${fqdn}: ${ip}: Adding IPv6 address\n" if $f_verbose;
+	dns_update_add($fqdn, (defined $f_ttl ? $f_ttl : $ttl6), 'AAAA', $ip);
     }
 }
     
@@ -822,7 +834,7 @@ if (defined $ipv6) {
 	print "${ipv6}: ${oname}: Removing stale IPv6 name\n" if $f_verbose;
 	dns_update_delete($oname, 'PTR', $ipv6)
     }
-    unless ($found) {
+    if (!$found || $f_force) {
 	print "${ipv6}: ${fqdn}: Adding IPv6 name\n" if $f_verbose;
 	dns_update_add($fqdn, (defined $f_ttl ? $f_ttl : $ttl6), 'PTR', $ipv6);
     }
